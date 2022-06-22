@@ -1,0 +1,312 @@
+import sys,os
+sys.path.append('/home/lgy/MGAT/')
+from joblib import Parallel, delayed
+import threading
+from Process.process import *
+import torch as th
+import torch.nn.functional as F
+import numpy as np
+from tools.earlystopping2class import EarlyStopping
+from torch_geometric.data import DataLoader
+from tqdm import tqdm
+from Process.data_split import *
+from tools.evaluate import *
+from Process.construct_H_graph_Weibo import edge_matrix
+from model.model import MHGAT
+import torch
+type_len = 6
+import copy
+
+edge_lst = {}
+type_x = []#6*6
+# map_index = []
+type_edge = []#6*6 * 2
+type_3,type_4 = [],[]
+type_node = []
+parent_x = []
+type_index = []
+traindroprate = 0.01
+testdroprate = 0
+valdroprate= 0
+batch_idx = 0
+mu = threading.Lock()
+
+temp_val_losses,temp_val_accs,temp_val_Acc_all, temp_val_Acc1, temp_val_Prec1, temp_val_Recll1, temp_val_F1, \
+        temp_val_Acc2, temp_val_Prec2, temp_val_Recll2, temp_val_F2 = [],[],[], [], [], [], [], [], [], [], []
+
+temp_test_losses,temp_test_accs,temp_test_Acc_all, temp_test_Acc1, temp_test_Prec1, temp_test_Recll1, temp_test_F1, \
+        temp_test_Acc2, temp_test_Prec2, temp_test_Recll2, temp_test_F2 = [],[],[], [], [], [], [], [], [], [], []
+
+def train_MHGAT(treeDic, x_test,x_val, x_train,traindroprate,valdroprate, lr, weight_decay,patience,n_epochs,batchsize,dataname,iter):
+    global model
+    model = MHGAT(in_feats=5000,hid_feats = 64, ntype=type_len,nclass=2,dropout=0.8).to(device)
+    print(model)
+    optimizer = th.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    train_losses = []
+    test_losses = []
+    train_accs = []
+    test_accs = []
+    val_losses = []
+    val_accs = []
+    best_test_acc = 0.0
+    best_val_acc = 0.0
+    early_stopping = EarlyStopping(patience=patience, verbose=True)
+
+    for epoch in range(n_epochs):
+        model.train()
+        traindata_list, valdata_list,testdata_list = loadBiData(dataname, treeDic, x_train, x_val, x_test)
+        train_loader = DataLoader(traindata_list, batch_size=batchsize,
+                                  shuffle=False, num_workers=10)
+        val_loader = DataLoader(valdata_list, batch_size=batchsize,
+                                 shuffle=True, num_workers=10)
+        test_loader = DataLoader(testdata_list, batch_size=batchsize,
+                                 shuffle=True, num_workers=10)
+        avg_loss, avg_acc = [], []
+        global batch_idx
+        batch_idx = 0
+
+
+        def thread_run(traindroprate,Batchdata):
+            batch = copy.copy(Batchdata)
+            type_edge, type_x, root_id, parent_id = edge_matrix( traindroprate,batch)
+            global batch_idx
+
+
+            global mu
+            if  mu.acquire():
+                print('get')
+
+                for i in range(type_len):
+                    for j in range(type_len):
+                        type_edge[i][j] = type_edge[i][j].to(device)
+                    # Batch_data.to(device)
+                edge_index = batch.edge_index.to(device)
+                x = batch.x.to(device)
+                y = batch.y.to(device)
+
+                global model
+                out_labels = model(type_edge,x,edge_index,type_x,root_id,parent_id,batch.batch,batch.rootindex)
+                loss = F.nll_loss(out_labels, y)
+                optimizer.zero_grad()
+                loss.backward()
+                avg_loss.append(loss.item())
+                optimizer.step()
+                _, pred = out_labels.max(dim=-1)
+                correct = pred.eq(y).sum().item()
+                train_acc = correct / len(y)
+                del type_edge, type_x, root_id, parent_id,x,y,edge_index
+                torch.cuda.empty_cache()
+                mu.release()
+                avg_acc.append(train_acc)
+                print("Iter {:03d} | Epoch {:05d} | Batch{:02d} | Train_Loss {:.4f}| Train_Accuracy {:.4f}".format(iter,epoch,batch_idx,loss.item(),train_acc))
+                batch_idx = batch_idx + 1
+                train_losses.append(np.mean(avg_loss))
+                train_accs.append(np.mean(avg_acc))
+                return None
+
+
+        Parallel(n_jobs=40, backend='threading')(
+            delayed(thread_run)(traindroprate, Batch_data) for Batch_data in
+            tqdm(train_loader))
+
+
+
+        global temp_test_losses, temp_test_Acc_all, temp_test_Acc1, temp_test_Prec1, temp_test_Recll1, temp_test_F1, \
+            temp_test_Acc2, temp_test_Prec2, temp_test_Recll2, temp_test_F2, temp_test_accs
+
+        temp_test_losses, temp_test_accs, temp_test_Acc_all, temp_test_Acc1, temp_test_Prec1, temp_test_Recll1, temp_test_F1, \
+        temp_test_Acc2, temp_test_Prec2, temp_test_Recll2, temp_test_F2 = [], [], [], [], [], [], [], [], [], [], []
+
+
+        model.eval()
+        batch_idx = 0
+
+        def thread_test(testdroprate, Batchdata):
+            global temp_test_losses, temp_test_accs, temp_test_Acc_all, temp_test_Acc1, temp_test_Prec1, temp_test_Recll1, temp_test_F1, \
+                temp_test_Acc2, temp_test_Prec2, temp_test_Recll2, temp_test_F2
+
+            batch = copy.copy(Batchdata)
+
+            type_edge, type_x, root_id, parent_id = edge_matrix(testdroprate,batch)
+
+            edge_index = batch.edge_index.to(device)
+
+
+
+
+            global mu,model
+            if mu.acquire():
+                for i in range(type_len):
+                    for j in range(type_len):
+                        type_edge[i][j] = type_edge[i][j].to(device)
+                x = batch.x.to(device)
+                y = batch.y.to(device)
+                test_out = model(type_edge, x, edge_index, type_x, root_id, parent_id, batch.batch, batch.rootindex)
+
+                test_loss = F.nll_loss(test_out, y)
+                temp_test_losses.append(test_loss.item())
+                _, test_pred = test_out.max(dim=1)
+                correct = test_pred.eq(y).sum().item()
+                test_acc = correct / len(y)
+                Acc_all, Acc1, Prec1, Recll1, F1, Acc2, Prec2, Recll2, F2 = evaluationclass(
+                    test_pred, y)
+                del type_edge, type_x, root_id, parent_id, x, y, edge_index
+                torch.cuda.empty_cache()
+                mu.release()
+                temp_test_Acc_all.append(Acc_all), temp_test_Acc1.append(Acc1), temp_test_Prec1.append(
+                    Prec1), temp_test_Recll1.append(Recll1), temp_test_F1.append(F1), \
+                temp_test_Acc2.append(Acc2), temp_test_Prec2.append(Prec2), temp_test_Recll2.append(
+                    Recll2), temp_test_F2.append(F2)
+                temp_test_accs.append(test_acc)
+            return None
+
+
+        Parallel(n_jobs=1, backend='threading')(
+            delayed(thread_test)(testdroprate, Batch_data) for Batch_data in
+            tqdm(test_loader))
+
+
+
+        test_losses.append(np.mean(temp_test_losses))
+        test_accs.append(np.mean(temp_test_accs))
+        print("Epoch {:05d} | test_Loss {:.4f}| test_Accuracy {:.4f}".format(epoch, np.mean(temp_test_losses),
+                                                                           np.mean(temp_test_accs)))
+
+        res = ['test_acc:{:.4f}'.format(np.mean(temp_test_Acc_all)),
+               'C1:{:.4f},{:.4f},{:.4f},{:.4f}'.format(np.mean(temp_test_Acc1), np.mean(temp_test_Prec1),
+                                                       np.mean(temp_test_Recll1), np.mean(temp_test_F1)),
+               'C2:{:.4f},{:.4f},{:.4f},{:.4f}'.format(np.mean(temp_test_Acc2), np.mean(temp_test_Prec2),
+                                                       np.mean(temp_test_Recll2), np.mean(temp_test_F2))]
+        print('results:', res)
+
+        if np.mean(temp_test_Acc_all) > best_test_acc:
+            best_test_acc = np.mean(temp_test_Acc_all)
+
+            model.eval()
+            all_3, all_4, batch_idx = 0, 0, 0
+
+            global temp_val_losses, temp_val_Acc_all, temp_val_Acc1, temp_val_Prec1, temp_val_Recll1, temp_val_F1, \
+                temp_val_Acc2, temp_val_Prec2, temp_val_Recll2, temp_val_F2, temp_val_accs
+
+            temp_val_losses, temp_val_accs, temp_val_Acc_all, temp_val_Acc1, temp_val_Prec1, temp_val_Recll1, temp_val_F1, \
+            temp_val_Acc2, temp_val_Prec2, temp_val_Recll2, temp_val_F2 = [], [], [], [], [], [], [], [], [], [], []
+
+            def thread_val(valdroprate, Batchdata):
+                global temp_test_losses, temp_test_accs, temp_test_Acc_all, temp_test_Acc1, temp_test_Prec1, temp_test_Recll1, temp_test_F1, \
+                    temp_test_Acc2, temp_test_Prec2, temp_test_Recll2, temp_test_F2
+
+                batch = copy.copy(Batchdata)
+
+                type_edge, type_x, root_id, parent_id = edge_matrix(valdroprate, batch)
+                edge_index = batch.edge_index.to(device)
+
+
+
+
+                global mu, model
+                if mu.acquire():
+                    for i in range(type_len):
+                        for j in range(type_len):
+                            type_edge[i][j] = type_edge[i][j].to(device)
+                    x = batch.x.to(device)
+                    y = batch.y.to(device)
+                    val_out = model(type_edge, x, edge_index, type_x, root_id, parent_id, batch.batch,
+                                    batch.rootindex)
+                    val_loss = F.nll_loss(val_out, y)
+                    temp_val_losses.append(val_loss.item())
+                    _, val_pred = val_out.max(dim=1)
+                    correct = val_pred.eq(y).sum().item()
+                    val_acc = correct / len(y)
+                    Acc_all, Acc1, Prec1, Recll1, F1, Acc2, Prec2, Recll2, F2 = evaluationclass(
+                        val_pred, y)
+                    del type_edge, type_x, root_id, parent_id, x, y, edge_index
+                    torch.cuda.empty_cache()
+                    mu.release()
+                    temp_val_Acc_all.append(Acc_all), temp_val_Acc1.append(Acc1), temp_val_Prec1.append(
+                        Prec1), temp_val_Recll1.append(Recll1), temp_val_F1.append(F1), \
+                    temp_val_Acc2.append(Acc2), temp_val_Prec2.append(Prec2), temp_val_Recll2.append(
+                        Recll2), temp_val_F2.append(F2)
+                    temp_val_accs.append(val_acc)
+                return None
+
+            Parallel(n_jobs=40, backend='threading')(
+                delayed(thread_val)(valdroprate, Batch_data) for Batch_data in
+                tqdm(val_loader))
+
+            val_losses.append(np.mean(temp_val_losses))
+            val_accs.append(np.mean(temp_val_accs))
+            print("Epoch {:05d} | val_Loss {:.4f}| val_Accuracy {:.4f}".format(epoch, np.mean(temp_val_losses),
+                                                                               np.mean(temp_val_accs)))
+
+            res = ['val_acc:{:.4f}'.format(np.mean(temp_val_Acc_all)),
+                   'C1:{:.4f},{:.4f},{:.4f},{:.4f}'.format(np.mean(temp_val_Acc1), np.mean(temp_val_Prec1),
+                                                           np.mean(temp_val_Recll1), np.mean(temp_val_F1)),
+                   'C2:{:.4f},{:.4f},{:.4f},{:.4f}'.format(np.mean(temp_val_Acc2), np.mean(temp_val_Prec2),
+                                                           np.mean(temp_val_Recll2), np.mean(temp_val_F2))]
+            print('results:', res)
+
+            early_stopping(np.mean(temp_val_losses), np.mean(temp_val_Acc_all), np.mean(temp_val_Acc1),
+                           np.mean(temp_val_Acc2), np.mean(temp_val_Prec1),
+                           np.mean(temp_val_Prec2), np.mean(temp_val_Recll1), np.mean(temp_val_Recll2),
+                           np.mean(temp_val_F1),
+                           np.mean(temp_val_F2), model, 'MHGAT', "Weibo")
+
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+
+    return early_stopping.accs, early_stopping.acc1, early_stopping.pre1, early_stopping.rec1, early_stopping.F1, early_stopping.acc2, \
+           early_stopping.pre2, early_stopping.rec2, early_stopping.F2
+
+
+lr=0.0001
+weight_decay=5e-4
+patience=20
+n_epochs=100
+batchsize= 12
+
+datasetname="Weibo"
+iterations=100
+model="MHGAT"
+device = th.device('cuda:0' if th.cuda.is_available() else 'cpu')
+
+val_accs,ACC1,ACC2,PRE1,PRE2,REC1,REC2,F1,F2 = [],[],[],[],[],[],[],[],[]
+for iter in range(iterations):
+    x_val, x_test, x_train = splitData(datasetname)
+    # fold0_x_val, fold0_x_test, fold0_x_train = splitData(datasetname)
+
+    treeDic=loadTree(datasetname)
+    accs, acc1, pre1, rec1, F1, acc2, pre2, rec2, F2 = train_MHGAT(treeDic,x_test,
+                                                                                   x_val,
+                                                                                   x_train,
+                                                                                   traindroprate,valdroprate,
+                                                                                   lr, weight_decay,
+                                                                                   patience,
+                                                                                   n_epochs,
+                                                                                   batchsize,
+                                                                                   datasetname,
+                                                                                   iter)
+    print("weibo : Accuracy: {:.4f} acc1: {:.4f}|acc2: {:.4f}|pre1: {:.4f}|pre2: {:.4f}"
+          "|rec1: {:.4f}|rec2: {:.4f}|F1: {:.4f}|F2: {:.4f}".format(accs, acc1,
+                                                                    acc2, pre1,
+                                                                    pre2,
+                                                                    rec1, rec2,
+                                                                    F1, F2))
+
+
+
+    val_accs.append(accs)
+    ACC1.append(acc1)
+    ACC2.append(acc2)
+    PRE1.append(pre1)
+    PRE2.append(pre2)
+    REC1.append(rec1)
+    REC2.append(rec2)
+    F1.append(F1)
+    F2.append(F2)
+print("weibo:|Total_val_ Accuracy: {:.4f}|acc1: {:.4f}|acc2: {:.4f}|pre1: {:.4f}|pre2: {:.4f}"
+                  "|rec1: {:.4f}|rec2: {:.4f}|F1: {:.4f}|F2: {:.4f}".format(sum(val_accs) / iterations, sum(ACC1) / iterations,
+                                                                            sum(ACC2) / iterations, sum(PRE1) / iterations, sum(PRE2) /iterations,
+                                                                            sum(REC1) / iterations, sum(REC2) / iterations, sum(F1) / iterations, sum(F2) / iterations))
+

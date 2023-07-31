@@ -1,4 +1,5 @@
-A Heterogeneous Propagation Graph Model for Rumor Detection Under the Relationship Among Multiple Propagation Subtrees
+Paper：
+# A Heterogeneous Propagation Graph Model for Rumor Detection Under the Relationship Among Multiple Propagation Subtrees
 Guoyi Li, Jingyuan Hu, Yulei Wu, Xiaodan Zhang, Wei Zhou & Honglei Lyu 
 
 # Datasets:  

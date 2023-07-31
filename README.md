@@ -1,3 +1,5 @@
+A Heterogeneous Propagation Graph Model for Rumor Detection Under the Relationship Among Multiple Propagation Subtrees
+Guoyi Li, Jingyuan Hu, Yulei Wu, Xiaodan Zhang, Wei Zhou & Honglei Lyu 
 
 # Datasets:  
 The datasets used in the experiments were based on the three publicly available Weibo and Twitter datasets released by Ma et al. (2016) and Ma et al. (2017):
